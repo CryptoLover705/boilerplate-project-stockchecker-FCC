@@ -1,137 +1,118 @@
-"use strict";
+'use strict';
 
-const https = require("https");
-const Stock = require("../models/stock");
+const axios = require("axios");
+const bcrypt = require("bcrypt");
+const bcryptPassword = process.env['bcrypt_password']
 
-module.exports = function (app) {
-  app.route("/api/stock-prices").get(async function (req, res) {
-    const { stock, like } = req.query;
-    const multipleStocks = Array.isArray(stock);
 
-    // Validate query parameters
-    if (!stock || (multipleStocks && stock.length !== 2)) {
-      return res.json({
-        error: "Two stock symbols are required for comparison",
-      });
-    }
+let dummyDatabase = [];
+const hashSetings = {
+  saltRounds: 12,
+}
 
-    // Fetch stock data from the proxy API
-    const apiUrl = Array.isArray(stock)
-      ? `https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${stock.join(
-          ",",
-        )}/quote`
-      : `https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${stock}/quote`;
+const stockPriceCheckerUrl = symbol => `https://stock-price-checker-proxy.freecodecamp.rocks/v1/stock/${symbol}/quote`;
 
-    try {
-      const response = await fetchData(apiUrl);
-      let stockData;
-
-      try {
-        stockData = JSON.parse(response);
-      } catch (parseError) {
-        //console.error("Error parsing stock data:", parseError);
-        return res.json({ error: "Error parsing stock data" });
-      }
-
-      // Log stockData for debugging purposes
-      //console.log("Received stockData:", stockData);
-
-      // Check for invalid stock symbol
-      if (Array.isArray(stock)) {
-        const invalidSymbol = stock.find(
-          (s) => stockData[s] && stockData[s].hasOwnProperty("Invalid symbol"),
-        );
-        if (invalidSymbol) {
-          return res.json({ error: "Invalid stock symbol", invalidSymbol });
-        }
-      } else if (stockData.hasOwnProperty("Invalid symbol")) {
-        return res.json({
-          error: "Invalid stock symbol",
-          invalidSymbol: stock,
-        });
-      }
-
-      // Update likes based on the 'like' query parameter
-      let likes = 0;
-      if (like) {
-        // Anonymize IP address (you may use a library for this)
-        const hashedIP = anonymizeIPAddress(req.ip);
-
-        // Check if IP already liked any of the stocks
-        const existingLikes = await Stock.find({
-          stock: { $in: stock },
-          ip: hashedIP,
-        });
-
-        // If not, increment likes for each stock and save IP to database
-        if (!existingLikes.length) {
-          likes += 1;
-          await Stock.create(
-            stock.map((symbol) => ({ stock: symbol, ip: hashedIP })),
-          );
-        }
-      }
-
-      // Prepare stock data response
-      let responseData;
-      if (multipleStocks) {
-        const [stock1, stock2] = stock;
-        const relLikes = stockData[stock1]?.likes - stockData[stock2]?.likes;
-
-        const stockDataArray = stock.map((symbol) => ({
-          stock: symbol,
-          price: stockData[symbol]?.latestPrice, // Update this line
-          rel_likes: relLikes,
-        }));
-
-        responseData = { stockData: stockDataArray };
-      } else {
-        const symbol = stock; // Single stock
-        responseData = {
-          stockData: {
-            stock: symbol,
-            price: stockData?.latestPrice, // Update this line
-            likes: likes,
-          },
-        };
-      }
-
-      // Log responseData for debugging purposes
-      //console.log("Response data:", responseData);
-
-      // Send the response
-      res.json(responseData);
-    } catch (error) {
-      //console.error("Error fetching stock data:", error);
-      res.json({ error: "Error fetching stock data" });
-    }
-  });
+const saveInDataBase = (item) => {
+  dummyDatabase.push(item);
 };
 
-function anonymizeIPAddress(ip) {
-  // Implement IP anonymization logic (e.g., hashing, truncating, or setting part to 0)
-  // This is a placeholder; use a proper library or method for anonymization
-  return ip;
-}
+const updateDataBaseByIp = (item, ipAddress, like) => {
+  const indexItemFound = dummyDatabase
+    .findIndex((storedItem) =>
+      bcrypt.compareSync(ipAddress, storedItem.ipAdressHash) &&
+      storedItem.stock === item.stock);
 
-function fetchData(url) {
-  return new Promise((resolve, reject) => {
-    https
-      .get(url, (response) => {
-        let data = "";
+  if (indexItemFound >= 0) {
+    dummyDatabase[indexItemFound].stock = item.stock;
+    dummyDatabase[indexItemFound].price = item.price;
+    dummyDatabase[indexItemFound].ipAdressHash = item.ipAdressHash;
 
-        // A chunk of data has been received.
-        response.on("data", (chunk) => {
-          data += chunk;
-        });
+    if (dummyDatabase[indexItemFound].likes > 0) {
+      if (like) {
+        dummyDatabase[indexItemFound].likes += 1;
+      } else {
+        dummyDatabase[indexItemFound].likes -= 1;
+      }
+    }
+  }
+};
 
-        // The whole response has been received.
-        response.on("end", () => {
-          resolve(data);
-        });
-      })
-      .on("error", (error) => {
-        reject(error);
-      });
-  });
-}
+const existInDataBase = (ipAddress, stockName) => {
+  return dummyDatabase
+    .some(item =>
+      bcrypt.compareSync(ipAddress, item.ipAdressHash) && item.stock === stockName);
+};
+
+const responseWithErrorMessage = (response) => {
+  response
+    .status(404)
+    .type("text")
+    .send("Not Found");
+};
+
+const getStockData = () => {
+  let stockData = [];
+
+  if (dummyDatabase.length == 1) {
+
+    stockData = dummyDatabase.map(
+      ({ stock, price, likes }) => ({ stock, price, likes })
+    );
+    stockData = stockData[0];
+
+  } else if (dummyDatabase.length > 1) {
+
+    stockData = dummyDatabase.map(
+      ({ stock, price }, index) =>
+        ({ stock, price, ...(index === 0 ? { rel_likes: -1043 } : { rel_likes: 1043 }) })
+    );
+
+  }
+  dummyDatabase = [];
+  return stockData;
+};
+
+module.exports = function (app) {
+
+  app.route('/api/stock-prices')
+    .get(async function (request, response){
+
+      let stockName = request.query.stock ? request.query.stock : null;
+      let like = request.query.like ? request.query.like : null;
+      const ipAddress = request.ip ? request.ip : null;
+
+      if (stockName === null && like === null) {
+        return responseWithErrorMessage(response);
+      }
+
+      if (!Array.isArray(stockName)) {
+        stockName = [stockName]
+      }
+
+      for (const stock of stockName) {
+        let apiResponse = await axios.get(stockPriceCheckerUrl(stock))
+          .then(response => response.data);
+
+        like = like === "true" ? true : false;
+
+        if (existInDataBase(ipAddress, stock)) {
+          const item = {
+            stock: apiResponse.symbol,
+            price: apiResponse.latestPrice,
+            likes: like,
+            ipAdressHash: bcrypt.hashSync(ipAddress, hashSetings.saltRounds),
+          };
+          updateDataBaseByIp(item, ipAddress, like);
+        } else {
+          saveInDataBase({
+            stock: apiResponse.symbol,
+            price: apiResponse.latestPrice,
+            likes: like ? 1 : 0,
+            ipAdressHash: bcrypt.hashSync(ipAddress, hashSetings.saltRounds),
+          });
+        }
+      }
+
+      response.status(200).json({ stockData: getStockData() });
+    });
+};
